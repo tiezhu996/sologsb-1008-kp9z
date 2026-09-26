@@ -1,11 +1,10 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
-import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import { createSeedProject, migrateProject, STATUS_LABELS, uid } from "../data";
+import type { ReviewStatus, ScenarioSpec, SignItem, SignProject } from "../types";
+import { analyzeSign, clampFont, cloneTerms, diffText, normalizeSpec } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
-const WIDTHS = [320, 480, 720, 960] as const;
 
 export const head: DocumentHead = {
   title: "公共标识多语言校对台",
@@ -27,8 +26,9 @@ export default component$(() => {
   const future = useSignal<SignProject[]>([]);
   const hydrated = useSignal(false);
   const online = useSignal(true);
-  const previewWidth = useSignal(480);
+  const view = useSignal<"editor" | "scenarios">("editor");
   const previewFont = useSignal(42);
+  const revertedSignIds = useSignal<string[]>([]);
   const selectedVersionId = useSignal("");
   const termSource = useSignal("");
   const termTarget = useSignal("");
@@ -39,6 +39,14 @@ export default component$(() => {
   const previewId = useSignal("");
   const readOnly = useSignal(false);
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+  const specOf = (sign: SignItem): ScenarioSpec =>
+    project.value.scenarios.find((spec) => spec.id === sign.scenarioId) ?? project.value.scenarios[0];
+  const activeSpec = () => specOf(active());
+  const activeFont = () => clampFont(activeSpec(), previewFont.value);
+  const riskOf = (sign: SignItem) => {
+    const spec = specOf(sign);
+    return analyzeSign(sign, spec, clampFont(spec, previewFont.value));
+  };
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -102,6 +110,60 @@ export default component$(() => {
       sign.emergencyRevision = !sign.emergencyRevision;
       if (sign.emergencyRevision) sign.status = "changes";
     });
+  });
+
+  const updateSpec = $((specId: string, patch: Partial<ScenarioSpec>) => {
+    const reverted: string[] = [];
+    commit("修改场景规格", (draft) => {
+      const spec = draft.scenarios.find((item) => item.id === specId);
+      if (!spec) return;
+      Object.assign(spec, patch);
+      normalizeSpec(spec);
+      // 规格变化后重算所有引用标识的风险，已确认但按新规格溢出的退回待确认。
+      for (const sign of draft.signs) {
+        if (sign.scenarioId !== specId) continue;
+        const analysis = analyzeSign(sign, spec, clampFont(spec, previewFont.value));
+        if (analysis.risk === "high" && sign.status === "confirmed") {
+          sign.status = "pending";
+          reverted.push(sign.id);
+        }
+      }
+    });
+    revertedSignIds.value = reverted;
+    toast.value = reverted.length ? `规格已更新，${reverted.length} 条已确认标识退回待确认` : "场景规格已更新";
+  });
+
+  const addScenario = $(() => {
+    commit("新增场景", (draft) => {
+      draft.scenarios.push({
+        id: uid("scenario"),
+        name: `新场景 ${draft.scenarios.length + 1}`,
+        width: 640,
+        minFontSize: 28,
+        maxFontSize: 56,
+        maxLines: 3,
+      });
+    });
+  });
+
+  const removeScenario = $((specId: string) => {
+    if (project.value.signs.some((sign) => sign.scenarioId === specId)) {
+      toast.value = "仍有标识使用该场景，无法删除";
+      return;
+    }
+    if (project.value.scenarios.length <= 1) {
+      toast.value = "至少保留一个场景";
+      return;
+    }
+    commit("删除场景", (draft) => {
+      draft.scenarios = draft.scenarios.filter((item) => item.id !== specId);
+    });
+  });
+
+  const openSign = $((signId: string) => {
+    commit("切换标识", (draft) => { draft.activeSignId = signId; });
+    selectedVersionId.value = "";
+    view.value = "editor";
   });
 
   const saveVersion = $(() => {
@@ -174,7 +236,7 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
-  const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
+  const preview = () => analyzeSign(active(), activeSpec(), activeFont());
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
     const version = selectedVersion();
@@ -186,7 +248,10 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if ((stored.schema === 1 || stored.schema === 2) && stored.project) {
+          const migrated = migrateProject(stored.project);
+          if (migrated) project.value = migrated;
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -202,7 +267,7 @@ export default component$(() => {
     if (!hydrated.value) return;
     track(() => project.value);
     const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: project.value }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 2, project: project.value }));
     }, 450);
     cleanup(() => window.clearTimeout(timer));
   });
@@ -223,16 +288,13 @@ export default component$(() => {
       } else if (event.key.toLowerCase() === "k") {
         event.preventDefault();
         navigateSign(-1);
-      } else if (event.key === "[") {
-        const index = WIDTHS.indexOf(previewWidth.value as (typeof WIDTHS)[number]);
-        previewWidth.value = WIDTHS[Math.max(0, index - 1)];
-      } else if (event.key === "]") {
-        const index = WIDTHS.indexOf(previewWidth.value as (typeof WIDTHS)[number]);
-        previewWidth.value = WIDTHS[Math.min(WIDTHS.length - 1, index + 1)];
-      } else if (event.key === "-") {
-        previewFont.value = Math.max(28, previewFont.value - 4);
-      } else if (event.key === "=") {
-        previewFont.value = Math.min(88, previewFont.value + 4);
+      } else if (event.key === "-" || event.key === "=") {
+        const current = project.value.signs.find((sign) => sign.id === project.value.activeSignId) ?? project.value.signs[0];
+        const spec = project.value.scenarios.find((item) => item.id === current?.scenarioId) ?? project.value.scenarios[0];
+        if (!spec) return;
+        previewFont.value = event.key === "-"
+          ? Math.max(spec.minFontSize, previewFont.value - 4)
+          : Math.min(spec.maxFontSize, previewFont.value + 4);
       }
     };
     window.addEventListener("online", updateOnline);
@@ -247,14 +309,16 @@ export default component$(() => {
 
   if (readOnly.value) {
     const sign = active();
-    const analysis = analyzeSign(sign, previewWidth.value, previewFont.value);
+    const spec = specOf(sign);
+    const fontSize = clampFont(spec, previewFont.value);
+    const analysis = analyzeSign(sign, spec, fontSize);
     return (
       <main data-theme="corporate" class="min-h-screen bg-slate-100 p-6">
         <div class="mx-auto max-w-5xl">
           <div class="mb-4 flex items-center justify-between">
             <div>
               <div class="text-xs font-bold uppercase tracking-[0.18em] text-slate-500">Read-only preview</div>
-              <h1 class="text-2xl font-bold text-slate-800">{sign.code} · {sign.scenario}</h1>
+              <h1 class="text-2xl font-bold text-slate-800">{sign.code} · {spec.name}</h1>
             </div>
             <span class={`badge ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
           </div>
@@ -262,9 +326,10 @@ export default component$(() => {
             <div class="mb-3 text-center text-xs text-slate-400">中文原文</div>
             <p class="mx-auto mb-10 max-w-2xl text-center text-lg text-slate-600">{sign.sourceText}</p>
             <div class="mx-auto border-y-4 border-slate-800 py-10 text-center">
-              <p class="whitespace-pre-line font-black leading-tight tracking-wide text-slate-900" style={{ fontSize: `${previewFont.value}px` }}>{analysis.visible.join("\n")}</p>
+              <p class="whitespace-pre-line font-black leading-tight tracking-wide text-slate-900" style={{ fontSize: `${fontSize}px` }}>{analysis.visible.join("\n")}</p>
             </div>
             <div class="mt-5 text-center text-sm text-slate-500">{sign.targetLanguage} · {sign.regulation}</div>
+            <div class="mt-1 text-center text-xs text-slate-400">规格：{spec.width}px 宽 · 字号 {spec.minFontSize}–{spec.maxFontSize}px · 最多 {spec.maxLines} 行</div>
           </section>
           <p class="mt-4 text-center text-xs text-slate-400">此链接读取当前浏览器中的本地版本，仅用于演示只读预览。</p>
         </div>
@@ -294,20 +359,124 @@ export default component$(() => {
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
-          <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
-          <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
-            {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
+          <button
+            class={`btn btn-sm ${view.value === "scenarios" ? "btn-primary" : "btn-outline border-white/30 text-white"}`}
+            onClick$={() => { view.value = view.value === "scenarios" ? "editor" : "scenarios"; }}
+          >
+            {view.value === "scenarios" ? "返回校对" : "场景规格"}
           </button>
+          {view.value === "editor" && (
+            <>
+              <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
+              <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
+                {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
+              </button>
+            </>
+          )}
         </div>
       </header>
 
-      {active().emergencyRevision && (
+      {view.value === "editor" && active().emergencyRevision && (
         <div class="alert alert-error sticky top-16 z-30 rounded-none border-x-0 py-2 text-white">
           <span class="text-lg">!</span>
           <span><strong>紧急修订模式</strong>：确认操作已锁定，修改后必须重新审校并保存版本。</span>
         </div>
       )}
 
+      {view.value === "scenarios" && (
+        <main class="min-h-[calc(100vh-64px)] overflow-y-auto bg-slate-50 p-6">
+          <div class="mx-auto max-w-6xl space-y-4">
+            <div class="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-600">Scenario Specs</div>
+                <h1 class="text-xl font-bold">场景版面规格</h1>
+                <p class="mt-1 text-sm text-slate-500">每个场景记录可用宽度、字号上下限与最多行数；标识按场景套用规格，风险随规格实时重算。</p>
+              </div>
+              <div class="flex items-center gap-2">
+                {project.value.signs.filter((sign) => riskOf(sign).risk === "high").length > 0 && (
+                  <span class="badge badge-error">{project.value.signs.filter((sign) => riskOf(sign).risk === "high").length} 条标识按当前规格高风险</span>
+                )}
+                <button class="btn btn-primary btn-sm" onClick$={addScenario}>新增场景</button>
+              </div>
+            </div>
+            {project.value.scenarios.map((spec) => {
+              const used = project.value.signs.filter((sign) => sign.scenarioId === spec.id);
+              const evaluated = used.map((sign) => ({ sign, analysis: riskOf(sign) }));
+              const highRisk = evaluated.filter((entry) => entry.analysis.risk === "high");
+              return (
+                <section key={spec.id} class="card border border-slate-200 bg-white shadow-sm">
+                  <div class="card-body gap-4 p-5">
+                    <div class="flex flex-wrap items-center gap-3">
+                      <input
+                        class="input input-sm input-bordered min-w-40 flex-1 font-bold"
+                        value={spec.name}
+                        aria-label="场景名称"
+                        onInput$={(_, element) => updateSpec(spec.id, { name: element.value })}
+                      />
+                      <span class="badge badge-outline">{used.length} 条标识</span>
+                      {highRisk.length > 0 && <span class="badge badge-error">{highRisk.length} 条高风险</span>}
+                      <button
+                        class="btn btn-xs btn-ghost text-error"
+                        disabled={used.length > 0 || project.value.scenarios.length <= 1}
+                        title={used.length > 0 ? "仍有标识使用该场景" : "删除场景"}
+                        onClick$={() => removeScenario(spec.id)}
+                      >删除</button>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3 md:grid-cols-4">
+                      <label class="form-control">
+                        <span class="label-text mb-1 text-xs font-bold text-slate-500">可用宽度 (px)</span>
+                        <input type="number" class="input input-sm input-bordered" min={120} max={2000} value={spec.width}
+                          onChange$={(_, element) => updateSpec(spec.id, { width: Number(element.value) })} />
+                      </label>
+                      <label class="form-control">
+                        <span class="label-text mb-1 text-xs font-bold text-slate-500">字号下限 (px)</span>
+                        <input type="number" class="input input-sm input-bordered" min={8} max={200} value={spec.minFontSize}
+                          onChange$={(_, element) => updateSpec(spec.id, { minFontSize: Number(element.value) })} />
+                      </label>
+                      <label class="form-control">
+                        <span class="label-text mb-1 text-xs font-bold text-slate-500">字号上限 (px)</span>
+                        <input type="number" class="input input-sm input-bordered" min={8} max={240} value={spec.maxFontSize}
+                          onChange$={(_, element) => updateSpec(spec.id, { maxFontSize: Number(element.value) })} />
+                      </label>
+                      <label class="form-control">
+                        <span class="label-text mb-1 text-xs font-bold text-slate-500">最多行数</span>
+                        <input type="number" class="input input-sm input-bordered" min={1} max={12} value={spec.maxLines}
+                          onChange$={(_, element) => updateSpec(spec.id, { maxLines: Number(element.value) })} />
+                      </label>
+                    </div>
+                    {evaluated.length ? (
+                      <div>
+                        <div class="text-xs font-bold uppercase tracking-[0.14em] text-slate-400">使用该场景的标识（按当前规格重算）</div>
+                        <div class="mt-2 space-y-1">
+                          {evaluated.map(({ sign, analysis }) => (
+                            <button
+                              key={sign.id}
+                              class={`flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-left text-sm transition ${analysis.risk === "high" ? "border-error/50 bg-red-50" : "border-slate-200 bg-white hover:border-slate-300"}`}
+                              onClick$={() => openSign(sign.id)}
+                            >
+                              <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
+                              <span class="min-w-0 flex-1 truncate">{sign.sourceText}</span>
+                              {revertedSignIds.value.includes(sign.id) && <span class="badge badge-warning badge-sm">已退回待确认</span>}
+                              <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                              <span class={`text-xs font-bold ${analysis.risk === "high" ? "text-error" : analysis.risk === "medium" ? "text-warning" : "text-success"}`}>
+                                {analysis.risk === "high" ? "高风险" : analysis.risk === "medium" ? "需留意" : "版面正常"}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <div class="rounded-lg border border-dashed p-4 text-center text-xs text-slate-400">暂无标识使用该场景。</div>
+                    )}
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        </main>
+      )}
+
+      {view.value === "editor" && (
       <div class="grid min-h-[calc(100vh-64px)] grid-cols-[270px_minmax(560px,1fr)_430px] gap-px bg-slate-300">
         <aside class="overflow-y-auto bg-slate-50 p-3">
           <div class="mb-3 rounded-xl bg-white p-4 shadow-sm">
@@ -317,7 +486,7 @@ export default component$(() => {
           </div>
           <div class="space-y-2">
             {project.value.signs.map((sign, index) => {
-              const risk = analyzeSign(sign, previewWidth.value, previewFont.value);
+              const risk = riskOf(sign);
               return (
                 <button
                   key={sign.id}
@@ -349,7 +518,7 @@ export default component$(() => {
           <div class="border-b border-slate-200 bg-slate-50 px-6 py-4">
             <div class="flex items-start justify-between gap-5">
               <div>
-                <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-600">{active().code} · {active().scenario}</div>
+                <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-600">{active().code} · {activeSpec().name}</div>
                 <h1 class="mt-1 text-xl font-bold">中文原文与译文校对</h1>
               </div>
               <div class="join">
@@ -386,7 +555,9 @@ export default component$(() => {
                   </label>
                   <label class="form-control">
                     <span class="label-text mb-1 text-xs font-bold text-slate-500">适用场景</span>
-                    <input class="input input-bordered" value={active().scenario} onInput$={(_, element) => updateActive("修改适用场景", (sign) => { sign.scenario = element.value; })} />
+                    <select class="select select-bordered" value={active().scenarioId} onChange$={(_, element) => updateActive("修改适用场景", (sign) => { sign.scenarioId = element.value; })}>
+                      {project.value.scenarios.map((spec) => <option key={spec.id} value={spec.id}>{spec.name}</option>)}
+                    </select>
                   </label>
                 </div>
                 <label class="form-control">
@@ -497,26 +668,29 @@ export default component$(() => {
                     {preview().risk === "high" ? "溢出风险" : preview().risk === "medium" ? "接近边界" : "版面安全"}
                   </span>
                 </div>
-                <div class="mt-3 flex gap-1">
-                  {WIDTHS.map((width) => <button key={width} class={`btn btn-xs flex-1 ${previewWidth.value === width ? "btn-primary" : "btn-outline"}`} onClick$={() => previewWidth.value = width}>{width}px</button>)}
+                <div class="mt-3 rounded-lg bg-slate-100 px-3 py-2 text-xs text-slate-600">
+                  <span class="font-bold text-slate-700">{activeSpec().name}</span>
+                  <span class="mx-1">·</span>宽 {activeSpec().width}px
+                  <span class="mx-1">·</span>字号 {activeSpec().minFontSize}–{activeSpec().maxFontSize}px
+                  <span class="mx-1">·</span>最多 {activeSpec().maxLines} 行
                 </div>
                 <div class="mt-2 flex items-center gap-3 text-xs">
-                  <span class="w-20">字号 {previewFont.value}px</span>
-                  <input type="range" min="28" max="88" step="2" class="range range-primary range-xs flex-1" value={previewFont.value} onInput$={(_, element) => previewFont.value = Number(element.value)} />
+                  <span class="w-20">字号 {activeFont()}px</span>
+                  <input type="range" min={activeSpec().minFontSize} max={activeSpec().maxFontSize} step="2" class="range range-primary range-xs flex-1" value={activeFont()} onInput$={(_, element) => previewFont.value = Number(element.value)} />
                 </div>
                 <div class="mt-4 overflow-hidden rounded-xl bg-slate-800 p-3">
-                  <div class="mx-auto grid min-h-48 place-items-center overflow-hidden border-4 border-white bg-[#174f3d] p-3 text-center text-white" style={{ width: `${previewWidth.value}px`, maxWidth: "100%" }}>
+                  <div class="mx-auto grid min-h-48 place-items-center overflow-hidden border-4 border-white bg-[#174f3d] p-3 text-center text-white" style={{ width: `${activeSpec().width}px`, maxWidth: "100%" }}>
                     <div>
-                      <div style={{ fontSize: `${previewFont.value}px` }} class="font-black leading-[1.18] tracking-wide">{preview().visible.map((line, index) => <div key={index}>{line || "\u00a0"}</div>)}</div>
+                      <div style={{ fontSize: `${activeFont()}px` }} class="font-black leading-[1.18] tracking-wide">{preview().visible.map((line, index) => <div key={index}>{line || "\u00a0"}</div>)}</div>
                     </div>
                   </div>
                 </div>
                 <div class="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
-                  <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{preview().lines.length}</strong><span>预计行数</span></div>
+                  <div class="rounded-lg bg-slate-100 p-2"><strong class={`block text-lg ${preview().overflow ? "text-error" : ""}`}>{preview().lines.length}/{activeSpec().maxLines}</strong><span>预计/最多行数</span></div>
                   <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{active().targetText.length}</strong><span>字符数</span></div>
                   <div class="rounded-lg bg-slate-100 p-2"><strong class={`block text-lg ${preview().missingTerms.length ? "text-error" : "text-success"}`}>{preview().missingTerms.length}</strong><span>缺失术语</span></div>
                 </div>
-                {(preview().overflow || preview().tooLong) && <div class="alert alert-error mt-3 py-2 text-xs">{preview().overflow ? "当前字号下内容超过三行，可能截断。" : "译文接近标识建议字符上限。"}</div>}
+                {(preview().overflow || preview().tooLong) && <div class="alert alert-error mt-3 py-2 text-xs">{preview().overflow ? `当前字号下内容超过 ${activeSpec().maxLines} 行上限，可能截断。` : "译文接近标识建议字符上限。"}</div>}
               </div>
             </div>
 
@@ -546,11 +720,12 @@ export default component$(() => {
 
             <div class="rounded-xl bg-[#17324d] p-4 text-xs text-slate-200">
               <div class="mb-2 font-bold text-white">键盘操作</div>
-              <div class="grid grid-cols-2 gap-y-1"><span><kbd class="kbd kbd-xs">J/K</kbd> 切换标识</span><span><kbd class="kbd kbd-xs">[ ]</kbd> 预览宽度</span><span><kbd class="kbd kbd-xs">- =</kbd> 字号</span><span><kbd class="kbd kbd-xs">Ctrl/⌘ Z</kbd> 撤销</span></div>
+              <div class="grid grid-cols-2 gap-y-1"><span><kbd class="kbd kbd-xs">J/K</kbd> 切换标识</span><span><kbd class="kbd kbd-xs">- =</kbd> 字号（限场景范围）</span><span><kbd class="kbd kbd-xs">Ctrl/⌘ Z</kbd> 撤销</span><span>宽度由场景规格决定</span></div>
             </div>
           </section>
         </aside>
       </div>
+      )}
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
     </div>

@@ -1,4 +1,15 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type { DiffToken, ScenarioSpec, SignItem, TermBinding } from "./types";
+
+export function clampFont(spec: ScenarioSpec, fontSize: number) {
+  return Math.min(spec.maxFontSize, Math.max(spec.minFontSize, fontSize));
+}
+
+export function normalizeSpec(spec: ScenarioSpec) {
+  spec.width = Math.min(2000, Math.max(120, Math.round(spec.width) || 120));
+  spec.minFontSize = Math.min(200, Math.max(8, Math.round(spec.minFontSize) || 8));
+  spec.maxFontSize = Math.min(240, Math.max(spec.minFontSize, Math.round(spec.maxFontSize) || spec.minFontSize));
+  spec.maxLines = Math.min(12, Math.max(1, Math.round(spec.maxLines) || 1));
+}
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];
@@ -31,13 +42,13 @@ export function estimatedLines(text: string, width: number, fontSize: number, li
   return lines;
 }
 
-export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
-  const lines = estimatedLines(sign.targetText, width, fontSize);
-  const lineCapacity = Math.max(1, Math.floor((width * 0.62) / (fontSize * 1.25)));
+export function analyzeSign(sign: SignItem, spec: ScenarioSpec, fontSize: number) {
+  const lines = estimatedLines(sign.targetText, spec.width, fontSize);
+  const lineCapacity = Math.max(1, spec.maxLines);
   const visible = lines.slice(0, lineCapacity);
   const overflow = lines.length > lineCapacity;
   const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
-  const estimatedCharacterLimit = Math.max(12, Math.floor((width - 48) / (fontSize * 0.55)) * lineCapacity);
+  const estimatedCharacterLimit = Math.max(12, Math.floor((spec.width - 48) / (fontSize * 0.55)) * lineCapacity);
   const tooLong = sign.targetText.replace(/\s/g, "").length > estimatedCharacterLimit;
   const missingTerms = sign.terms.filter(
     (term) => term.required && !sign.targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase()),

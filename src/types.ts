@@ -24,6 +24,15 @@ export interface TermBinding {
   confirmed: boolean;
 }
 
+export interface ScenarioSpec {
+  id: string;
+  name: string;
+  width: number;
+  minFontSize: number;
+  maxFontSize: number;
+  maxLines: number;
+}
+
 export interface VersionSnapshot {
   id: string;
   label: string;
@@ -40,7 +49,7 @@ export interface SignItem {
   sourceText: string;
   targetLanguage: string;
   targetText: string;
-  scenario: string;
+  scenarioId: string;
   regulation: string;
   status: ReviewStatus;
   terms: TermBinding[];
@@ -56,11 +65,12 @@ export interface SignProject {
   location: string;
   activeSignId: string;
   signs: SignItem[];
+  scenarios: ScenarioSpec[];
   updatedAt: string;
 }
 
 export interface PersistedProject {
-  schema: 1;
+  schema: 2;
   project: SignProject;
 }
 
