@@ -1,4 +1,4 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type { DiffToken, LayoutSpec, SignItem, TermBinding } from "./types";
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];
@@ -31,14 +31,41 @@ export function estimatedLines(text: string, width: number, fontSize: number, li
   return lines;
 }
 
-export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
+export type RiskLevel = "high" | "medium" | "low";
+
+export interface SignAnalysis {
+  lines: string[];
+  visible: string[];
+  /** 预计行数超过场景允许的最多行数。 */
+  overflow: boolean;
+  /** 译文长度超过当前宽度/字号下的建议容量。 */
+  tooLong: boolean;
+  /** 预览宽度或字号不在所属场景规格范围内。 */
+  outOfSpec: boolean;
+  missingTerms: TermBinding[];
+  risk: RiskLevel;
+}
+
+export const FALLBACK_SPEC: LayoutSpec = {
+  id: "scn-fallback",
+  name: "未指定场景",
+  widths: [320, 480, 720, 960],
+  minFont: 28,
+  maxFont: 88,
+  maxLines: 3,
+  updatedAt: "",
+};
+
+export function analyzeSign(sign: SignItem, spec: LayoutSpec | undefined, width: number, fontSize: number): SignAnalysis {
+  const layout = spec ?? FALLBACK_SPEC;
   const lines = estimatedLines(sign.targetText, width, fontSize);
-  const lineCapacity = Math.max(1, Math.floor((width * 0.62) / (fontSize * 1.25)));
-  const visible = lines.slice(0, lineCapacity);
-  const overflow = lines.length > lineCapacity;
-  const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
-  const estimatedCharacterLimit = Math.max(12, Math.floor((width - 48) / (fontSize * 0.55)) * lineCapacity);
+  const maxLines = Math.max(1, layout.maxLines);
+  const visible = lines.slice(0, maxLines);
+  const overflow = lines.length > maxLines;
+  const estimatedCharacterLimit = Math.max(12, Math.floor((width - 48) / (fontSize * 0.55)) * maxLines);
   const tooLong = sign.targetText.replace(/\s/g, "").length > estimatedCharacterLimit;
+  const outOfSpec =
+    !layout.widths.includes(width) || fontSize < layout.minFont || fontSize > layout.maxFont;
   const missingTerms = sign.terms.filter(
     (term) => term.required && !sign.targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase()),
   );
@@ -47,9 +74,27 @@ export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
     visible,
     overflow,
     tooLong,
+    outOfSpec,
     missingTerms,
-    risk: overflow || tooLong || missingTerms.length ? "high" : lines.length >= lineCapacity - 1 ? "medium" : "low",
+    risk:
+      overflow || tooLong || outOfSpec || missingTerms.length
+        ? "high"
+        : lines.length >= maxLines - 1
+          ? "medium"
+          : "low",
   };
+}
+
+/** 把标识上记录的宽度档/字号收敛到场景规格允许的范围内。 */
+export function clampLayout(spec: LayoutSpec | undefined, width: number, fontSize: number) {
+  const layout = spec ?? FALLBACK_SPEC;
+  const nextWidth = layout.widths.includes(width)
+    ? width
+    : layout.widths.includes(480)
+      ? 480
+      : layout.widths[0];
+  const nextFont = Math.min(layout.maxFont, Math.max(layout.minFont, fontSize));
+  return { width: nextWidth, font: nextFont };
 }
 
 function tokenize(value: string) {
